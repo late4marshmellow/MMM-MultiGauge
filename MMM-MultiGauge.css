@@ -1,0 +1,37 @@
+/* MMM-MultiGauge CSS - Multi-gauge dashboard layouts */
+
+.mg-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Horizontal layout */
+.mg-layout-horizontal {
+  flex-direction: row;
+}
+
+/* Vertical layout */
+.mg-layout-vertical {
+  flex-direction: column;
+}
+
+/* Grid layout */
+.mg-layout-grid {
+  display: grid;
+  justify-items: center;
+  align-items: center;
+}
+
+.mg-card {
+  width: 100px;
+  height: 100px;
+  transition: filter 0.3s ease-in-out;
+}
+
+.mg-alt {
+  display: none;
+  color: #fff;
+  text-align: center;
+  padding: 10px;
+}

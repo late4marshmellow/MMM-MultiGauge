@@ -1,0 +1,338 @@
+#!/usr/bin/env node
+/**
+ * Homey Device Discovery Tool
+ * Finds devices and their capabilities for MMM-MultiGauge configuration
+ */
+
+const http = require("node:http");
+
+// ============================================================================
+// CONFIGURATION - Update these values
+// ============================================================================
+const HOMEY_IP = "HOMEY_IP";
+// Replace with your Homey API token. You can generate the token in the Homey settings.
+const HOMEY_TOKEN = "API_KEY";
+
+// ============================================================================
+// SEARCH FILTERS (customize as needed)
+// ============================================================================
+const filters = {
+  // Search by device name (case-insensitive, partial match)
+  name: process.argv[2] || "",
+
+  // Search by capability (e.g., "measure_power", "meter_", "temperature")
+  capability: process.argv[3] || "",
+
+  // Search by zone name
+  zone: process.argv[4] || "",
+
+  // Search by unit/postfix (e.g., "W", "Wh", "°C", "kWh")
+  postfix: process.argv[5] || "",
+
+  // Only show devices with specific capability types
+  onlyCapabilities: [], // e.g., ["measure_power", "meter_consumption", "measure_temperature"]
+
+  // Exclude devices by name pattern
+  exclude: [], // e.g., ["test", "old"]
+
+  // Show only devices in specific zones
+  onlyZones: [] // e.g., ["Living Room", "Kitchen"]
+};
+
+// ============================================================================
+// FETCH HOMEY DATA
+// ============================================================================
+async function fetchHomeyDevices () {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: HOMEY_IP,
+      path: "/api/manager/devices/device",
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${HOMEY_TOKEN}`
+      }
+    };
+
+    http.get(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Failed to parse JSON: ${e.message}`));
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+// ============================================================================
+// FILTER AND DISPLAY LOGIC
+// ============================================================================
+function matchesFilters (device, zoneName, capabilitiesObj) {
+  // Name filter
+  if (filters.name && !device.name.toLowerCase().includes(filters.name.toLowerCase())) {
+    return false;
+  }
+
+  // Zone filter
+  if (filters.zone && !zoneName.toLowerCase().includes(filters.zone.toLowerCase())) {
+    return false;
+  }
+
+  // Exclude patterns
+  if (filters.exclude.some((pattern) => device.name.toLowerCase().includes(pattern.toLowerCase()))) {
+    return false;
+  }
+
+  // Only specific zones
+  if (filters.onlyZones.length > 0 && !filters.onlyZones.includes(zoneName)) {
+    return false;
+  }
+
+  // Capability filter
+  if (filters.capability) {
+    const hasCapability = Object.keys(device.capabilitiesObj || {}).some((cap) => cap.toLowerCase().includes(filters.capability.toLowerCase()));
+    if (!hasCapability) {
+      return false;
+    }
+  }
+
+  // Only specific capabilities
+  if (filters.onlyCapabilities.length > 0) {
+    const hasRequiredCap = Object.keys(device.capabilitiesObj || {}).some((cap) => filters.onlyCapabilities.some((reqCap) => cap.includes(reqCap)));
+    if (!hasRequiredCap) {
+      return false;
+    }
+  }
+
+  // Postfix/unit filter
+  if (filters.postfix && capabilitiesObj) {
+    const hasMatchingUnit = Object.values(capabilitiesObj).some((cap) => {
+      const unit = cap.units || "";
+      return unit.toLowerCase().includes(filters.postfix.toLowerCase());
+    });
+    if (!hasMatchingUnit) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function formatCapabilityValue (cap) {
+  if (cap.value === null || cap.value === undefined) {
+    return "null";
+  }
+  if (typeof cap.value === "number") {
+    return cap.value.toFixed(2);
+  }
+  if (typeof cap.value === "boolean") {
+    return cap.value
+      ? "true"
+      : "false";
+  }
+  return String(cap.value);
+}
+
+function getCapabilityUnit (cap) {
+  if (cap.units) {
+    return cap.units;
+  }
+
+  // Common capability units
+  const unitMap = {
+    measure_power: "W",
+    meter_power: "kWh",
+    measure_temperature: "°C",
+    measure_humidity: "%",
+    measure_voltage: "V",
+    measure_current: "A",
+    meter_consumption: "W",
+    dim: "%",
+    volume_set: "%"
+  };
+
+  for (const [key, unit] of Object.entries(unitMap)) {
+    if (cap.id.includes(key)) {
+      return unit;
+    }
+  }
+
+  return "";
+}
+
+function generateMQTTTopic (deviceId, capabilityId) {
+  return `homey/devices/${deviceId}/capabilities/${capabilityId}/value`;
+}
+
+function generateGaugeConfig (device, capName, cap) {
+  const unit = getCapabilityUnit(cap);
+  const currentValue = typeof cap.value === "number"
+    ? cap.value
+    : 0;
+
+  // Suggest max value based on capability type
+  let maxValue = 100;
+  if (capName.includes("power") || capName.includes("consumption")) {
+    maxValue = 5000;
+  } else if (capName.includes("temperature")) {
+    maxValue = 30;
+  } else if (capName.includes("humidity")) {
+    maxValue = 100;
+  } else if (capName.includes("voltage")) {
+    maxValue = 250;
+  } else if (capName.includes("current")) {
+    maxValue = 20;
+  }
+
+  return {
+    id: `${device.name.toLowerCase().replace(/[^a-z0-9]/g, "_")}_${capName.replace(/[^a-z0-9]/g, "_")}`,
+    maxValue,
+    postfix: unit,
+    mqtt: {
+      topic: generateMQTTTopic(device.id, capName),
+      parser: "plain",
+      valuePath: "value"
+    }
+  };
+}
+
+// ============================================================================
+// MAIN EXECUTION
+// ============================================================================
+async function main () {
+  console.log("\n╔══════════════════════════════════════════════════════════════════╗");
+  console.log("║          Homey Device Discovery for MMM-MultiGauge              ║");
+  console.log("╚══════════════════════════════════════════════════════════════════╝\n");
+
+  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+    console.log("Usage: node discover-homey-devices.js [name-filter] [capability-filter] [zone-filter] [postfix-filter]\n");
+    console.log("Examples:");
+    console.log("  node discover-homey-devices.js                    # Show all devices");
+    console.log("  node discover-homey-devices.js power              # Devices with \"power\" in name");
+    console.log("  node discover-homey-devices.js \"\" measure_power   # Devices with measure_power capability");
+    console.log("  node discover-homey-devices.js \"\" \"\" \"Living\"     # Devices in zones containing \"Living\"");
+    console.log("  node discover-homey-devices.js \"\" \"\" \"\" \"W\"        # Devices with capabilities using \"W\" unit");
+    console.log("  node discover-homey-devices.js \"\" \"\" \"\" \"Wh\"       # Devices with capabilities using \"Wh\" unit");
+    console.log("  node discover-homey-devices.js electricity \"\" \"\" \"Wh\" # Electricity devices with Wh sensors");
+    console.log("  node discover-homey-devices.js light dim          # Lights with dim capability\n");
+    process.exit(0);
+  }
+
+  console.log(`Filters: name="${filters.name}" capability="${filters.capability}" zone="${filters.zone}" postfix="${filters.postfix}"\n`);
+
+  try {
+    console.log("Fetching devices from Homey...\n");
+    const devicesData = await fetchHomeyDevices();
+
+    // Convert object to array if needed
+    const devices = Array.isArray(devicesData)
+      ? devicesData
+      : Object.values(devicesData);
+
+    const filteredDevices = [];
+
+    for (const device of devices) {
+      const zoneName = device.zone?.name || "No Zone";
+
+      if (!matchesFilters(device, zoneName, device.capabilitiesObj)) {
+        continue;
+      }
+
+      filteredDevices.push({
+        name: device.name,
+        id: device.id,
+        zone: zoneName,
+        class: device.class || "unknown",
+        capabilities: device.capabilitiesObj || {}
+      });
+    }
+
+    if (filteredDevices.length === 0) {
+      console.log("No devices found matching filters.");
+      console.log("\nActive filters:");
+      if (filters.name) {
+        console.log(`  - Name contains: "${filters.name}"`);
+      }
+      if (filters.capability) {
+        console.log(`  - Capability contains: "${filters.capability}"`);
+      }
+      if (filters.zone) {
+        console.log(`  - Zone contains: "${filters.zone}"`);
+      }
+      process.exit(0);
+    }
+
+    console.log(`Found ${filteredDevices.length} device(s):\n`);
+    console.log("═".repeat(80));
+
+    const gaugeConfigs = [];
+
+    for (const device of filteredDevices) {
+      console.log(`\n📱 ${device.name}`);
+      console.log(`   ID: ${device.id}`);
+      console.log(`   Zone: ${device.zone}`);
+      console.log(`   Class: ${device.class}`);
+      console.log("   Capabilities:");
+
+      const capabilities = Object.entries(device.capabilities);
+
+      if (capabilities.length === 0) {
+        console.log("      (none)");
+        continue;
+      }
+
+      for (const [capName, cap] of capabilities) {
+        const value = formatCapabilityValue(cap);
+        const unit = getCapabilityUnit(cap);
+        const title = cap.title || capName;
+
+        console.log(`      • ${title} (${capName})`);
+        console.log(`        Current: ${value} ${unit}`.trim());
+        console.log(`        MQTT: ${generateMQTTTopic(device.id, capName)}`);
+
+        // Generate gauge config for numeric capabilities
+        if (typeof cap.value === "number") {
+          const gaugeConfig = generateGaugeConfig(device, capName, cap);
+          gaugeConfigs.push(gaugeConfig);
+        }
+      }
+    }
+
+    // Show generated gauge configurations
+    if (gaugeConfigs.length > 0) {
+      console.log(`\n\n${"═".repeat(80)}`);
+      console.log("\n📊 GENERATED GAUGE CONFIGURATIONS:\n");
+      console.log("Add these to your MMM-MultiGauge config:\n");
+      console.log("gauges: [");
+
+      gaugeConfigs.forEach((config, idx) => {
+        console.log("  {");
+        console.log(`    id: "${config.id}",`);
+        console.log(`    maxValue: ${config.maxValue},`);
+        console.log(`    postfix: "${config.postfix}",`);
+        console.log("    mqtt: {");
+        console.log(`      topic: "${config.mqtt.topic}",`);
+        console.log(`      parser: "${config.mqtt.parser}",`);
+        console.log(`      valuePath: "${config.mqtt.valuePath}"`);
+        console.log("    }");
+        console.log(`  }${idx < gaugeConfigs.length - 1
+          ? ","
+          : ""}`);
+      });
+
+      console.log("]\n");
+    }
+
+    console.log(`${"═".repeat(80)}\n`);
+  } catch (error) {
+    console.error("Error:", error.message);
+    process.exit(1);
+  }
+}
+
+main();

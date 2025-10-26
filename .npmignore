@@ -1,0 +1,2 @@
+# Exclude local helper script from npm packages
+tools/discover-homey-devices.js

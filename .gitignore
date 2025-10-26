@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# User's configured discovery tool (keep credentials safe)
+tools/discover-homey-devices.js
+
+# Development
+.DS_Store
+*.log
+npm-debug.log*
+.vscode/
+.idea/
