@@ -460,8 +460,36 @@ Module.register("MMM-MultiGauge", {
         // eslint-disable-next-line no-console
         console.log("[MMM-MultiGauge] boolean:", payload);
       }
+      // Update stored boolean state
       this.gaugeBooleans[payload.gaugeId] = Boolean(payload.value);
-      this.updateDOM();
+
+      /*
+       * Immediately refresh glow based on the current numeric value to avoid
+       * a stuck glow when the boolean turns off but no numeric update arrives.
+       */
+      const index = this.config.gauges.findIndex((gauge) => gauge.id === payload.gaugeId);
+      let chart = null;
+      if (index > -1) {
+        chart = this.charts[index];
+      }
+
+      if (chart) {
+        const currentValue = this.gaugeData[payload.gaugeId];
+        // Use 0 if we never received a value yet
+        let value = 0;
+        if (typeof currentValue === "number") {
+          value = currentValue;
+        }
+        this.applyGlowEffects({
+          index,
+          gaugeId: payload.gaugeId,
+          value,
+          chart
+        });
+      } else {
+        // If chart isn't ready yet, fall back to re-render
+        this.updateDOM();
+      }
     } else if (notification === "MG_ERROR" && this.config.verbose) {
       // eslint-disable-next-line no-console
       console.error("[MMM-MultiGauge] error:", payload);
