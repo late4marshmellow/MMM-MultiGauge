@@ -1,6 +1,6 @@
 {
 	"name": "mmm-multigauge",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Universal multi-gauge dashboard for MagicMirror - display multiple independent sensor gauges",
 	"keywords": [
 		"dashboard",
