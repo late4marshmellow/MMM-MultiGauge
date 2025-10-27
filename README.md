@@ -34,7 +34,7 @@ Add to your `config/config.js`:
 ```javascript
 {
   module: "MMM-MultiGauge",
-  position: "top_left",
+  position: "bottom_center",
   config: {
     layout: "horizontal", // "horizontal" | "vertical" | "grid"
     spacing: 10,
