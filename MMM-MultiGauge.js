@@ -75,6 +75,8 @@ Module.register("MMM-MultiGauge", {
       token: "",
       headers: {},
       insecureTLS: false},
+    token: "",
+    tokenType: "",
     updateInterval: 30 * 1000,
     verbose: false
   },

@@ -223,8 +223,12 @@ module.exports = NodeHelper.create({
         headers: {}
       };
 
-      if (this.config.api.token) {
-        opts.headers.Authorization = `${this.config.api.tokenType || "Bearer"} ${this.config.api.token}`;
+      // Use token from top-level config if available, otherwise fall back to api.token
+      const token = this.config.token || this.config.api.token;
+      const tokenType = this.config.tokenType || this.config.api.tokenType || "Bearer";
+
+      if (token) {
+        opts.headers.Authorization = `${tokenType} ${token}`;
       }
 
       Object.assign(opts.headers, this.config.api.headers || {});
