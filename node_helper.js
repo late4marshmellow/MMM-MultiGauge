@@ -19,11 +19,9 @@ module.exports = NodeHelper.create({
 
   socketNotificationReceived (notification, payload) {
     if (notification === "MG_CONFIG") {
+      // eslint-disable-next-line no-console
+      console.log("[MMM-MultiGauge] Received config with", payload.gauges.length, "gauges");
       this.config = payload;
-      if (this.config.verbose) {
-        // eslint-disable-next-line no-console
-        console.log("[MMM-MultiGauge] Received config");
-      }
       this.setupConnections();
     }
   },
@@ -33,16 +31,21 @@ module.exports = NodeHelper.create({
       return;
     }
 
-    // Setup MQTT if any gauge uses it
-    const mqttGauges = this.config.gauges.filter((gauge) => gauge.mqtt && gauge.mqtt.topic);
+    // Setup MQTT if any gauge uses it (check mqtt, mqtt_boolean, OR mqtt_secondary)
+    const mqttGauges = this.config.gauges.filter((gauge) => gauge.mqtt?.topic || gauge.mqtt_boolean?.topic || gauge.mqtt_secondary?.topic);
+
     if (mqttGauges.length > 0 && this.config.mqtt && this.config.mqtt.url) {
-      this.setupMQTT(mqttGauges);
+      // Pass all gauges; subscribeMQTTTopics filters by configured topics.
+      this.setupMQTT(this.config.gauges);
     }
 
     // Setup API polling for gauges that use it
     this.config.gauges.forEach((gauge) => {
       if (gauge.api && gauge.api.baseUrl) {
         this.setupAPIPolling(gauge);
+      }
+      if (gauge.api_secondary && gauge.api_secondary.baseUrl) {
+        this.setupAPISecondaryPolling(gauge);
       }
     });
   },
@@ -51,8 +54,12 @@ module.exports = NodeHelper.create({
     if (this.mqttClient) {
       if (this.config.verbose) {
         // eslint-disable-next-line no-console
-        console.log("[MMM-MultiGauge] MQTT already connected");
+        console.log("[MMM-MultiGauge] MQTT already connected, re-subscribing to topics");
       }
+      // Re-subscribe to all topics (handles browser refresh without server restart)
+      gauges.forEach((gauge) => {
+        this.subscribeMQTTTopics(gauge);
+      });
       return;
     }
 
@@ -126,16 +133,31 @@ module.exports = NodeHelper.create({
         }
       });
     }
+    // Subscribe to secondary topic
+    if (gauge.mqtt_secondary && gauge.mqtt_secondary.topic) {
+      this.mqttClient.subscribe(gauge.mqtt_secondary.topic, {qos: this.config.mqtt.qos || 0}, (err) => {
+        if (err) {
+          // eslint-disable-next-line no-console
+          console.error(`[MMM-MultiGauge] Failed to subscribe to ${gauge.mqtt_secondary.topic}:`, err);
+        } else {
+          // eslint-disable-next-line no-console
+          console.log(`[MMM-MultiGauge] Subscribed to secondary ${gauge.mqtt_secondary.topic} for gauge ${gauge.id}`);
+        }
+      });
+    }
   },
 
   handleMQTTMessage (topic, message, gauges) {
     const gaugeValue = gauges.find((gauge) => gauge.mqtt && gauge.mqtt.topic === topic);
     const gaugeBoolean = gauges.find((gauge) => gauge.mqtt_boolean && gauge.mqtt_boolean.topic === topic);
+    const gaugeSecondary = gauges.find((gauge) => gauge.mqtt_secondary && gauge.mqtt_secondary.topic === topic);
 
     if (gaugeValue) {
       this.handleMqttValueMessage(topic, message, gaugeValue);
     } else if (gaugeBoolean) {
       this.handleMqttBooleanMessage(topic, message, gaugeBoolean);
+    } else if (gaugeSecondary) {
+      this.handleMqttSecondaryMessage(topic, message, gaugeSecondary);
     }
   },
 
@@ -180,19 +202,15 @@ module.exports = NodeHelper.create({
     try {
       const msg = message.toString();
       let value = null;
-
       if (gaugeBoolean.mqtt_boolean.parser === "plain") {
-        const lower = msg.toLowerCase().trim();
-        value = lower === "true" || lower === "1" || lower === "on";
+        value = this.parseBooleanOrStateFromPlain(msg);
       } else {
-        const obj = JSON.parse(msg);
-        const rawValue = this.getNestedValue(obj, gaugeBoolean.mqtt_boolean.valuePath || "value");
-        value = Boolean(rawValue);
+        value = this.parseBooleanOrStateFromJson(msg, gaugeBoolean);
       }
 
       if (this.config.verbose) {
         // eslint-disable-next-line no-console
-        console.log(`[MMM-MultiGauge] ${gaugeBoolean.id} boolean: ${value}`);
+        console.log(`[MMM-MultiGauge] ${gaugeBoolean.id} boolean/state: ${JSON.stringify(value)} (type: ${typeof value})`);
       }
 
       this.sendSocketNotification("MG_BOOLEAN", {
@@ -205,6 +223,100 @@ module.exports = NodeHelper.create({
     }
   },
 
+  parseBooleanOrStateFromPlain (msg) {
+    const trimmed = this.unwrapJsonQuotedString(msg.trim());
+    const lower = trimmed.toLowerCase();
+
+    if (lower === "true" || lower === "1" || lower === "on") {
+      return true;
+    }
+
+    if (lower === "false" || lower === "0" || lower === "off") {
+      return false;
+    }
+
+    // Keep non-boolean payloads as state strings for glowStates.
+    return trimmed;
+  },
+
+  parseBooleanOrStateFromJson (msg, gaugeBoolean) {
+    const obj = JSON.parse(msg);
+    const rawValue = this.getNestedValue(obj, gaugeBoolean.mqtt_boolean.valuePath || "value");
+
+    if (typeof rawValue === "boolean" || typeof rawValue === "string") {
+      return rawValue;
+    }
+
+    return Boolean(rawValue);
+  },
+
+  unwrapJsonQuotedString (value) {
+    try {
+      const parsed = JSON.parse(value);
+      if (typeof parsed === "string") {
+        return parsed;
+      }
+    } catch {
+      // Keep original value when not valid JSON.
+    }
+
+    return value;
+  },
+
+  handleMqttSecondaryMessage (topic, message, gaugeSecondary) {
+    try {
+      const msg = message.toString();
+      let value = null;
+      if (gaugeSecondary.mqtt_secondary.parser === "plain") {
+        value = this.parseSecondaryFromPlain(msg);
+      } else {
+        value = this.parseSecondaryFromJson(msg, gaugeSecondary);
+      }
+
+      // Allow both strings and numbers
+      if (value === null || typeof value === "undefined" || value === "") {
+        if (this.config.verbose) {
+          // eslint-disable-next-line no-console
+          console.warn(`[MMM-MultiGauge] Empty secondary value from ${topic}:`, msg);
+        }
+        return;
+      }
+
+      if (this.config.verbose) {
+        // eslint-disable-next-line no-console
+        console.log(`[MMM-MultiGauge] ${gaugeSecondary.id} secondary: ${value}`);
+      }
+
+      this.sendSocketNotification("MG_SECONDARY", {
+        gaugeId: gaugeSecondary.id,
+        value
+      });
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error(`[MMM-MultiGauge] Error parsing secondary value from ${topic}:`, error.message);
+    }
+  },
+
+  parseSecondaryFromPlain (msg) {
+    const numValue = parseFloat(msg);
+    if (isNaN(numValue)) {
+      return msg.trim();
+    }
+
+    return numValue;
+  },
+
+  parseSecondaryFromJson (msg, gaugeSecondary) {
+    const obj = JSON.parse(msg);
+    const value = this.getNestedValue(obj, gaugeSecondary.mqtt_secondary.valuePath || "value");
+
+    if (typeof value === "string") {
+      return this.unwrapJsonQuotedString(value);
+    }
+
+    return value;
+  },
+
   setupAPIPolling (gauge) {
     if (this.pollingIntervals[gauge.id]) {
       clearInterval(this.pollingIntervals[gauge.id]);
@@ -213,6 +325,17 @@ module.exports = NodeHelper.create({
     // Initial fetch
     this.pollAPI(gauge);
     this.pollingIntervals[gauge.id] = setInterval(() => this.pollAPI(gauge), this.config.updateInterval || 30000);
+  },
+
+  setupAPISecondaryPolling (gauge) {
+    const intervalId = `${gauge.id}_secondary`;
+    if (this.pollingIntervals[intervalId]) {
+      clearInterval(this.pollingIntervals[intervalId]);
+    }
+
+    // Initial fetch
+    this.pollAPISecondary(gauge);
+    this.pollingIntervals[intervalId] = setInterval(() => this.pollAPISecondary(gauge), this.config.updateInterval || 30000);
   },
 
   async pollAPI (gauge) {
@@ -260,6 +383,53 @@ module.exports = NodeHelper.create({
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error(`[MMM-MultiGauge] API error for ${gauge.id}:`, error.message);
+    }
+  },
+
+  async pollAPISecondary (gauge) {
+    try {
+      const url = gauge.api_secondary.baseUrl + (gauge.api_secondary.path || "");
+      const opts = {
+        method: this.config.api.method || "GET",
+        headers: {}
+      };
+
+      // Use token from top-level config if available, otherwise fall back to api.token
+      const token = this.config.token || this.config.api.token;
+      const tokenType = this.config.tokenType || this.config.api.tokenType || "Bearer";
+
+      if (token) {
+        opts.headers.Authorization = `${tokenType} ${token}`;
+      }
+
+      Object.assign(opts.headers, this.config.api.headers || {});
+
+      const response = await fetch(url, opts);
+      const data = await response.json();
+
+      const value = this.getNestedValue(data, gauge.api_secondary.valuePath || "value");
+
+      // Allow both strings and numbers
+      if (value === null || typeof value === "undefined" || value === "") {
+        if (this.config.verbose) {
+          // eslint-disable-next-line no-console
+          console.warn(`[MMM-MultiGauge] Empty API secondary value for ${gauge.id}`);
+        }
+        return;
+      }
+
+      if (this.config.verbose) {
+        // eslint-disable-next-line no-console
+        console.log(`[MMM-MultiGauge] API secondary ${gauge.id}: ${value}`);
+      }
+
+      this.sendSocketNotification("MG_SECONDARY", {
+        gaugeId: gauge.id,
+        value
+      });
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error(`[MMM-MultiGauge] API secondary error for ${gauge.id}:`, error.message);
     }
   },
 
